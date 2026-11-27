@@ -125,6 +125,84 @@ def competition(full_name, number):
     return 0
 
 
+def merged_recently(full_name, days=60):
+    """这个 repo 最近有没有 PR 真被合并过。
+
+    这是判断「这单能不能成」最硬的一条指标：赏金 repo 如果 60 天里
+    一个 PR 都没合过，说明维护者根本不动，挂了也是白挂。
+    （Ubiquity 那 $600 单：23 个外部 PR 全灭、0 合并。）
+    """
+    cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - days * 86400))
+    q = "repo:" + full_name + " is:pr is:merged merged:>=" + cutoff
+    d = gh("api", "-X", "GET", "search/issues", "-f", "q=" + q, "-f", "per_page=1")
+    if isinstance(d, dict):
+        return d.get("total_count", 0)
+    return 0
+
+
+GATE_WORDS = (
+    "you must be a core team member",
+    "only core team",
+    "allowedroles",
+    "core team member, or an administrator",
+    "invite only",
+    "internal only",
+)
+
+CODE_VERBS = (
+    "implement", "fix", "add ", "support", "update", "refactor", "handle",
+    "write ", "build", "migrate", "implementing", "bug", "feature", "cleanup",
+    "test", "docs", "type", "lint", "api", "endpoint", "module",
+)
+
+RESEARCH_WORDS = (
+    "mathematical", "theorem", "conjecture", "proof", "formalization",
+    "lean 4", "arxiv", "research coordination", "open question", "inequality",
+    "reconstruction", "prize", "mathematics",
+)
+
+
+def is_code_task(text):
+    """这单是不是「写代码就能交」的活。
+
+    研究/数学类悬赏（题面是 'mathematical problems'、'Lean verification'）
+    看着像单子，实际是无限期研究项目 —— 直接跳过。
+    """
+    t = (text or "").lower()
+    if any(w in t for w in RESEARCH_WORDS):
+        return False
+    return any(v in t for v in CODE_VERBS)
+
+
+POINTER = re.compile(
+    r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)"
+)
+
+
+def real_target(cand):
+    """镜像仓库（目录型）issue 的正文常常只有一个链接 —— 顺着它找真单。
+
+    devpool-directory#5012 的正文就是 ubiquity-os-marketplace/...#301 的链接；
+    不顺着查，就会被目录仓库的"还活着"骗过去。
+    """
+    body = (cand.get("body") or "").strip()
+    if not body or len(body) > 300:
+        return None
+    m = POINTER.search(body)
+    if not m:
+        return None
+    repo, num = m.group(1), m.group(2)
+    if repo.lower() == (cand.get("repo") or "").lower():
+        return None
+    return repo, num
+
+
+def has_permission_gate(text):
+    """机器人门禁 —— 外面的人根本 start 不了这单。"""
+    t = (text or "").lower()
+    return any(w in t for w in GATE_WORDS)
+
+
 def looks_gray(text):
     t = (text or "").lower()
     return any(w in t for w in GRAY_WORDS)
@@ -191,19 +269,12 @@ def collect_github():
     return out
 
 
-def bounty_marker(cand):
+def bounty_marker(cand, comments):
     """去 issue 评论里找金额标记。
 
     Algora 的金额写在 bot 评论里（/bounty $500），Opire 的在 bot 评论里
     （opire.dev 链接 + 金额）。标题里没有金额的，多半是这种。
     """
-    comments = gh(
-        "api", "repos/" + cand["repo"] + "/issues/" + str(cand["number"])
-        + "/comments?per_page=100",
-        default=[],
-    )
-    if not isinstance(comments, list):
-        return 0.0, None, [], False
     best = 0.0
     ev = None
     rails = set()
@@ -225,6 +296,16 @@ def bounty_marker(cand):
         )):
             taken = True
     return best, ev, sorted(rails), taken
+
+
+def issue_comments(cand):
+    """拉 issue 评论（一次性，金额 / 门禁 / 收款通道都从这里看）。"""
+    out = gh(
+        "api", "repos/" + cand["repo"] + "/issues/" + str(cand["number"])
+        + "/comments?per_page=100",
+        default=[],
+    )
+    return out if isinstance(out, list) else []
 
 
 CASH_RAILS = ("upwork", "paypal", "stripe", "wise", "bank transfer")
@@ -263,6 +344,11 @@ def enrich(cand, args):
     """补全候选单；不合格的直接丢掉。"""
     if not cand.get("repo"):
         return None
+    # 镜像仓库 → 顺着正文链接换到真单所在仓库
+    ptr = real_target(cand)
+    if ptr:
+        cand = dict(cand)
+        cand["repo"], cand["number"] = ptr
     meta = repo_meta(cand["repo"])
     if not meta or meta["archived"]:
         return None
@@ -283,10 +369,21 @@ def enrich(cand, args):
     ev = None
     rails = []
     taken = False
+    comments = issue_comments(cand)
+    blob_all = " ".join([
+        cand["title"], cand.get("body") or "", " ".join(cand["labels"]),
+        meta["desc"], " ".join((c.get("body") or "") for c in comments[:40]),
+    ])
+    # 机器人门禁：外面的人根本 start 不了 —— 直接扔
+    if has_permission_gate(blob_all):
+        return None
+    # 不是写代码就能交的活（数学/研究类悬赏）—— 跳过
+    if not is_code_task(blob_all[:1500]):
+        return None
     if not amount:
-        amount, ev, rails, taken = bounty_marker(cand)
+        amount, ev, rails, taken = bounty_marker(cand, comments)
     else:
-        _, ev, rails, taken = bounty_marker(cand)
+        _, ev, rails, taken = bounty_marker(cand, comments)
     if amount < args.min:
         return None
     if repo_age > args.repo_days:
@@ -299,6 +396,9 @@ def enrich(cand, args):
 
     comp = competition(cand["repo"], cand["number"])
     if comp >= args.max_comp and amount < 200:
+        return None
+    # 60 天里一个 PR 都没合过 —— 维护者根本不动，挂单是摆设
+    if merged_recently(cand["repo"], args.merge_days) == 0:
         return None
     if meta["stars"] == 0 and cand["comments"] <= 1 and not (cand.get("body") or "").strip():
         return None
@@ -382,6 +482,8 @@ def main():
     ap.add_argument("--days", type=int, default=21, help="issue 最多多少天没动静")
     ap.add_argument("--repo-days", type=int, default=45, help="repo 最多多少天没 push")
     ap.add_argument("--max-comp", type=int, default=8, help="竞争 PR 超过这个数就跳过")
+    ap.add_argument("--merge-days", type=int, default=60,
+                    help="repo 最近多少天里必须真合并过 PR，否则跳过")
     ap.add_argument("--rail", default="",
                     help="只要这些收款通道的（逗号分隔），例: paypal,usdc,upwork")
     ap.add_argument("--out", default="board.md")
