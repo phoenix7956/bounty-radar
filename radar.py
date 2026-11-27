@@ -153,6 +153,10 @@ def collect_github():
         "label:bounty is:open",
         'label:"Bounty" is:open',
         '"/bounty $" in:comments is:open',
+        "label:reward is:open",
+        'label:"💰" is:open',
+        "bounty in:title is:open",
+        '"reward" in:title is:open',
     ]
     seen = set()
     for q in queries:
@@ -378,6 +382,8 @@ def main():
     ap.add_argument("--days", type=int, default=21, help="issue 最多多少天没动静")
     ap.add_argument("--repo-days", type=int, default=45, help="repo 最多多少天没 push")
     ap.add_argument("--max-comp", type=int, default=8, help="竞争 PR 超过这个数就跳过")
+    ap.add_argument("--rail", default="",
+                    help="只要这些收款通道的（逗号分隔），例: paypal,usdc,upwork")
     ap.add_argument("--out", default="board.md")
     args = ap.parse_args()
 
@@ -396,6 +402,11 @@ def main():
             if it:
                 items.append(it)
     items.sort(key=lambda x: x["score"], reverse=True)
+
+    if args.rail:
+        want = [r.strip().lower() for r in args.rail.split(",") if r.strip()]
+        items = [it for it in items
+                 if any(w in r.lower() for r in it.get("rails") or [] for w in want)]
 
     board = render(items)
     print(board)
