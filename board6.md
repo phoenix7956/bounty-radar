@@ -4,7 +4,7 @@
 
 | 金额 | 单 | 状态 | 说明 |
 |---|---|---|---|
-| $175 | Expensify/App#106035 | 可投 | 清空 Composer 刷新后草稿复现。指派者 Uzaifm127 11-18 报"马上做"但没开 PR，维护者已降级 Weekly。已有 4 个外部 proposal 同一根因。proposal 草稿已写好，待用户拍板 posting。根因：`useDebouncedSaveDraft.ts` 的 `cancelSaveDraft` 没调 `debouncedSaveDraft.cancel()`；`ComposerWithSuggestions.tsx` 的 `updateComment` 空串要走同步保存。 |
+| $175 | Expensify/App#106035 | 可投（补丁已就绪） | 清空 Composer 刷新后草稿复现。指派者 Uzaifm127 11-18 报"马上做"但没开 PR，维护者已降级 Weekly。已有 4 个外部 proposal 同一根因。**补丁已在 245 那台 Windows 落地并提交**：分支 `fix/106035-cleared-composer-draft`，commit `03ca813`，3 文件 +34/-4，diff 逐字核对一致，未 push。根因：`useDebounce` 默认导出不暴露 cancel → `cancelSaveDraft` 形同虚设；清空草稿走 debounce 不会在卸载前落库 → 旧草稿复活；且挂起的那次写入不取消的话 1 秒后照样把旧文本写回去。proposal 稿见 proposal_106035.md，待用户拍板 posting。 |
 
 ## 已排除
 
