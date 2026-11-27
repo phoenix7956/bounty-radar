@@ -1,0 +1,81 @@
+--- a/src/pages/inbox/report/useDebouncedSaveDraft.ts
++++ b/src/pages/inbox/report/useDebouncedSaveDraft.ts
+@@ -1,4 +1,4 @@
+-import useDebounce from '@hooks/useDebounce';
++import {useDebounceWithControls} from '@hooks/useDebounce';
+ 
+ import CONST from '@src/CONST';
+ 
+@@ -19,7 +19,7 @@
+ function useDebouncedSaveDraftImpl(saveDraftFn: (...args: unknown[]) => void, wait = CONST.TIMING.DRAFT_SAVE_DEBOUNCE_TIME, shouldExecuteOnUnmount = false): UseDebouncedSaveDraftResult {
+     const isSavePending = useRef(false);
+ 
+-    const debouncedSaveDraft = useDebounce(
++    const {invoke: debouncedSaveDraft, cancel: cancelDebouncedSaveDraft} = useDebounceWithControls(
+         (...args: unknown[]) => {
+             if (!isSavePending.current) {
+                 return;
+@@ -39,6 +39,8 @@
+ 
+     const cancelSaveDraft = () => {
+         isSavePending.current = false;
++        // Drop the pending debounced write entirely, so a stale draft cannot land after the edit session ends.
++        cancelDebouncedSaveDraft();
+     };
+ 
+     return {
+--- a/src/pages/inbox/report/ReportActionCompose/ComposerWithSuggestions.tsx
++++ b/src/pages/inbox/report/ReportActionCompose/ComposerWithSuggestions.tsx
+@@ -245,7 +245,7 @@
+ 
+     // Save the draft of the report comment. This debounced so that we're not ceaselessly saving your edit. Saving the draft
+     // allows one to navigate somewhere else and come back to the comment and still have it in edit mode.
+-    const {saveDraft: debouncedSaveComment, isSavePending: isCommentSavePending} = useDebouncedSaveDraft(
++    const {saveDraft: debouncedSaveComment, isSavePending: isCommentSavePending, cancelSaveDraft: cancelSaveComment} = useDebouncedSaveDraft(
+         (comment: string) => {
+             saveReportDraftComment(reportID, comment);
+         },
+@@ -539,7 +539,13 @@
+             return;
+         }
+ 
+-        if (shouldDebounceSaveComment) {
++        // Clearing the composer has to be persisted synchronously: a debounced write would not run before the
++        // page tears down, leaving the stale draft in storage and resurrecting it the next time the report opens.
++        // Cancelling the pending write also stops a queued non-empty write from restoring the old draft.
++        if (!newCommentConverted) {
++            cancelSaveComment();
++            saveReportDraftComment(reportID, '');
++        } else if (shouldDebounceSaveComment) {
+             debouncedSaveComment(newCommentConverted);
+         } else {
+             saveReportDraftComment(reportID, newCommentConverted);
+--- a/tests/unit/hooks/useDebouncedSaveDraft.test.ts
++++ b/tests/unit/hooks/useDebouncedSaveDraft.test.ts
+@@ -101,4 +101,26 @@
+ 
+         expect(saveDraftFn).not.toHaveBeenCalled();
+     });
++
++    // Regression test for https://github.com/Expensify/App/issues/106035: cancelSaveDraft has to drop the pending
++    // debounced write, not only flip the isSavePending flag. Otherwise a queued write of the old composer content
++    // can land after the composer was cleared and restore the stale draft.
++    it('cancelSaveDraft drops the pending debounced timer', () => {
++        const saveDraftFn = jest.fn();
++        const wait = 1000;
++
++        const {result} = renderHook(() => useDebouncedSaveDraft(saveDraftFn, wait));
++
++        act(() => {
++            result.current.saveDraft('edited message');
++        });
++
++        expect(jest.getTimerCount()).toBeGreaterThan(0);
++
++        act(() => {
++            result.current.cancelSaveDraft();
++        });
++
++        expect(jest.getTimerCount()).toBe(0);
++    });
+ });
