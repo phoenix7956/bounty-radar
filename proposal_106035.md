@@ -4,7 +4,7 @@
 **标题**: `[$175] Chat - Cleared Composer draft reappears after refresh`
 **报价**: $175　**工期**: 3 个工作日
 
-## 根因（阿烛逐行核对 main 分支确认）
+## 根因（阿烛逐行核对 main 分支确认，win的marvis 复核）
 
 1. `src/pages/inbox/report/useDebouncedSaveDraft.ts:40-42`
    `cancelSaveDraft` 只置 `isSavePending.current = false`，**没有 cancel 定时器**。
@@ -14,20 +14,30 @@
    - `onClear`（921 行）→ `updateComment('', true)` → 走 debounce 分支（543 行 `debouncedSaveComment`）
    - 同步分支本来就有（545 行 `saveReportDraftComment(reportID, ...)`），只是清空场景没走它
    - 1000ms 定时器还没跑就刷新 → IndexedDB 里是旧草稿 → 刷新后复现
+   - 补充：`useDebounce` 默认导出只返回 `.invoke`，把 `useDebounceWithControls` 的 `cancel` 丢了，
+     所以 `cancelSaveDraft` 只能清 flag、cancel 不到定时器
+   - 补充：即使改成同步保存，**不**取消挂起的那次写入，它 1 秒后仍带着旧文本参数落库 → 旧草稿照样回来
 
 ## 修法（按现有代码写法，不新造轮子）
 
 1. `useDebouncedSaveDraft.ts`：改用已导出的 `useDebounceWithControls`（返回 `{invoke, cancel}`），
-   把 `cancel` 句柄挂进 `cancelSaveDraft`，让它真正取消挂起的保存。
-2. `ComposerWithSuggestions.tsx`：清空草稿时走**同步**保存 —— 让 `onClear` 调 `updateComment('', false)`，
-   或在 `updateComment` 里对空串强制同步，落到现成的 `saveReportDraftComment(reportID, '')`
-   （`saveReportActionDraft` / `saveReportDraftComment` 已在 51 行 import）。
+   解构成 `{invoke: debouncedSaveDraft, cancel: cancelDebouncedSaveDraft}`，
+   并在 `cancelSaveDraft` 里调用 `cancelDebouncedSaveDraft()`，让它真正取消挂起的保存。
+2. `ComposerWithSuggestions.tsx`：解构出 `cancelSaveDraft: cancelSaveComment`；
+   在 `updateComment` 里，当新内容为空时 —— 先 `cancelSaveComment()` 取消挂起写入，
+   再同步 `saveReportDraftComment(reportID, '')`（走现成的同步分支，不新造写法）。
+
+**补丁已在 245 那台 Windows 上落地，并提交到本地分支 `fix/106035-cleared-composer-draft`**
+（3 个文件，+34/-4；diff 已用 base64 逐字核对一致）。
 
 ## 测试
 
-`tests/unit/ReportActionComposeTest.ts`：
-- 清空 composer 后立刻保存 → 落库的是空草稿
-- 挂起的非空 debounce 保存被 cancel → 刷新后不复活
+`tests/unit/hooks/useDebouncedSaveDraft.test.ts` 新增回归用例
+`cancelSaveDraft drops the pending debounced timer`：
+挂起写入后调 `cancelSaveDraft`，`jest.getTimerCount()` 从 >0 变成 0（证明定时器被真正取消，
+而不是只翻了 flag）。原有 #98580 的用例保留。
+
+**本地没跑测试**：245 那台没有 `node_modules`，按规程不装依赖；由 Expensify CI 验证。
 
 ## 要贴到 issue 评论里的 proposal（英文，147 词）
 
@@ -35,13 +45,13 @@
 >
 > **Problem.** Clearing the Composer and refreshing within ~1s resurrects the previous draft: the debounced save never fires before the page tears down.
 >
-> **Root cause.** In `ComposerWithSuggestions.tsx`, `updateComment` routes the empty-string save through `debouncedSaveComment` (1000ms timer), and `cancelSaveDraft` in `useDebouncedSaveDraft.ts` only flips a flag — it never calls `debouncedSaveDraft.cancel()`. So the empty-draft `Onyx.merge` cannot commit in time, and the stale draft in IndexedDB reappears on reload.
+> **Root cause.** In `ComposerWithSuggestions.tsx`, `updateComment` routes the empty-string save through `debouncedSaveComment` (1000ms timer), so the empty draft is never committed before the page unloads and the stale IndexedDB draft reappears on reload. On top of that, `cancelSaveDraft` in `useDebouncedSaveDraft.ts` cannot cancel anything: the default `useDebounce` export only exposes `.invoke`, so the `cancel` of `useDebounceWithControls` is dropped, and a queued write of the old composer content can still land afterwards.
 >
 > **Plan.**
-> 1. `useDebouncedSaveDraft.ts`: `cancelSaveDraft` also invokes `debouncedSaveDraft.cancel()`.
-> 2. `ComposerWithSuggestions.tsx`: when the converted comment is empty (or save is not debounced), cancel any pending debounced save, then call `saveReportDraftComment(reportID, '')` / `saveReportActionDraft(...)` synchronously.
+> 1. `useDebouncedSaveDraft.ts`: use `useDebounceWithControls` and destructure `{invoke, cancel}`; `cancelSaveDraft` now cancels the pending debounced write instead of only flipping a flag.
+> 2. `ComposerWithSuggestions.tsx`: when the converted comment is empty, cancel the pending debounced write and then save the empty draft synchronously via `saveReportDraftComment(reportID, '')`.
 >
-> **Tests.** Unit test in `tests/unit/ReportActionComposeTest.ts`: clearing the composer immediately triggers a committed empty draft; a pending non-empty debounced save is cancelled and cannot resurrect after reload.
+> **Tests.** Regression test in `tests/unit/hooks/useDebouncedSaveDraft.test.ts`: after `cancelSaveDraft` the pending debounced timer is gone (`jest.getTimerCount() === 0`), so a stale draft can no longer land.
 >
 > **Quote & timeline.** $175, 3 business days to PR.
 
